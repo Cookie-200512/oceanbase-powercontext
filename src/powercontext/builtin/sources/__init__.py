@@ -61,12 +61,14 @@ from powercontext.builtin.sources.skill_usage import (
     SkillUsageSourceAdapter,
 )
 from powercontext.sources import TEXT_EVIDENCE_PROJECTION_KEY, SourceDefinitionRegistry, TextEvidence
+from powercontext.sources.csv_rows import CSV_ROW_SOURCE_DEFINITION
 
 BUILTIN_SOURCE_REGISTRY = SourceDefinitionRegistry((
     CONTENT_SOURCE_DEFINITION,
     EXTERNAL_SKILL_SNAPSHOT_SOURCE_DEFINITION,
     SKILL_PACKAGE_UPLOAD_SOURCE_DEFINITION,
     SKILL_USAGE_SOURCE_DEFINITION,
+    CSV_ROW_SOURCE_DEFINITION,
 ))
 
 __all__ = [
