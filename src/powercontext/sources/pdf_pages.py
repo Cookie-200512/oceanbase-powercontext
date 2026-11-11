@@ -316,6 +316,41 @@ def _pdf_rank_pages(pages, question, seed_rank=None):
     return ranked
 
 
+
+_STATEMENT_KINDS = (
+    ("income", r"consolidated\s+(?:statements?\s+of\s+(?:operations|income|earnings)|income\s+statements?)"),
+    ("balance", r"consolidated\s+balance\s+sheets?"),
+    ("cash", r"consolidated\s+statements?\s+of\s+cash\s+flows?"),
+    ("summary", r"(?:table\s+\d+[.:]?\s*)?summary\s+of\s+(?:financial\s+performance|financial\s+condition)"),
+    ("segment", r"(?:summary\s+of\s+)?(?:business\s+)?segment\s+(?:data|information)"),
+)
+
+_NUMERIC_QUESTION = re.compile(
+    r"how\s+much|how\s+many|rate|ratio|margin|percent|amount|cost|revenue|sales|"
+    r"profit|income|tax|ebitda|capex|expense|spend|price|value|balance|debt|"
+    r"dividend|buyback|repurchase",
+    re.I,
+)
+
+_CONTINUED = re.compile(r"\s*\(continued\)\s*$")
+
+
+def _statement_kinds(text):
+    """Return statement kinds whose title is a heading line on this page."""
+    lines = [
+        line.strip().lower().rstrip(".")
+        for line in text.splitlines()[:6]
+        if line.strip()
+    ]
+    kinds = []
+    for kind, pattern in _STATEMENT_KINDS:
+        for line in lines:
+            if re.fullmatch(pattern, _CONTINUED.sub("", line)):
+                kinds.append(kind)
+                break
+    return kinds
+
+
 async def search_pdf_pages(
     memory, question: str, limit: int = 10,
 ) -> tuple[MemoryCitation, ...]:
@@ -350,9 +385,37 @@ async def search_pdf_pages(
         return ()
 
     ranked = _pdf_rank_pages(pages, question, seed_rank)
+    head = list(ranked[:12])
+
+    # Financial questions often need the primary statements, which lexical
+    # ranking tends to bury under notes. Keep the best page of each kind.
+    if _NUMERIC_QUESTION.search(question) and limit > 12:
+        near_docs = {row[2] for row in head[:6]}
+        picked = {}
+        for row in ranked:
+            if row[2] not in near_docs:
+                continue
+            for kind in _statement_kinds(row[3]):
+                picked.setdefault(kind, row)
+        for row in picked.values():
+            if len(head) >= min(limit, 18):
+                break
+            if any(row[1] is item[1] for item in head):
+                continue
+            head.append(row)
+
+    chosen = {id(row[1]) for row in head}
+    for row in ranked:
+        if len(head) >= limit:
+            break
+        if id(row[1]) in chosen:
+            continue
+        head.append(row)
+        chosen.add(id(row[1]))
+
     citations = []
-    for _, record, _, _, _ in ranked[:limit]:
-        citation = record.citation
+    for row in head[:limit]:
+        citation = row[1].citation
         await memory.get(GetMemoryEntryRequest(citation=citation))
         citations.append(citation)
     return tuple(citations)
