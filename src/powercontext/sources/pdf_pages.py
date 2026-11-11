@@ -193,134 +193,165 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 
 
 
+
 _PDF_STOP = set(
-    "a an the of to in on at by for from with and or as is are was "
-    "were be been being do does did how what which who when where why "
-    "much many its it their this that these those company corporation "
-    "inc year fiscal during between percent percentage calculate "
-    "calculated amount total".split()
+    "a an the of to in on at by for from with and or as is are was were "
+    "be been being do does did how what which who when where why much many "
+    "its it their this that these those company corporation inc year fiscal "
+    "during between percent percentage calculate calculated amount total "
+    "answer respond response question assuming perspective investment analyst "
+    "only use using shown details give relying define directly explicitly "
+    "outlined then state any has have had important ongoing reported report "
+    "unadjusted usd million billion fy".split()
 )
 
 
 def _pdf_terms(text):
-    words = re.findall(r"[a-z]+|\d+", text.lower())
-    return [
-        word[:-1]
-        if len(word) > 4 and word.endswith("s")
-        and not word.endswith(("ss", "us", "is"))
-        else word
-        for word in words if word not in _PDF_STOP
+    terms = []
+    for word in re.findall(r'[a-z]+|\d+', text.lower()):
+        if word in _PDF_STOP:
+            continue
+        if len(word) > 4 and word.endswith('ies'):
+            word = word[:-3] + 'y'
+        elif len(word) > 4 and word.endswith('s') and not word.endswith(('ss', 'us', 'is')):
+            word = word[:-1]
+        terms.append(word)
+    return terms
+
+
+def _pdf_rank_pages(pages, question, seed_rank=None):
+    """Rank live pages using only their text and the caller's question."""
+    from collections import Counter
+    import math
+
+    compact = re.sub(r'[^a-z0-9]', '', question.lower())
+    names = {
+        doc: re.sub(r'[^a-z0-9]', '', re.split(r'(?:19|20)\d{2}', doc.lower())[0])
+        for _, doc, _ in pages
+    }
+    matched = {
+        doc for doc, name in names.items()
+        if len(name) >= 2 and name in compact
+    }
+    pool = [
+        (record, doc, text, _pdf_terms(text))
+        for record, doc, text in pages
     ]
+    corpus = [row for row in pool if not matched or row[1] in matched]
+    frequency = Counter()
+    for _, _, _, tokens in corpus:
+        frequency.update(set(tokens))
+    count = len(corpus)
+    average = sum(len(row[3]) for row in corpus) / max(1, count) or 1
+
+    weights = {
+        term: 1.0 for term in _pdf_terms(question)
+        if not term.isdigit()
+    }
+    for name in names.values():
+        if name in weights:
+            weights[name] = 0.05
+
+    groups = (
+        ('geography geographic geographical geographies region regions countries country international america europe asia africa', 0.55),
+        ('legal battle litigation lawsuit lawsuits court proceedings proceeding contingency contingencies', 0.70),
+        ('revenue revenues sale sales turnover', 0.45),
+        ('income profit profits earning earnings', 0.45),
+        ('capex capital expenditure expenditures investing', 0.55),
+        ('depreciation amortization', 0.55),
+        ('repurchase buyback repurchased', 0.50),
+        ('dividend distribution dividends', 0.45),
+        ('restructuring reorganization severance', 0.50),
+        ('debt borrowing borrowings loan loans', 0.45),
+    )
+    for words, weight in groups:
+        synonyms = set(_pdf_terms(words))
+        if synonyms.intersection(weights):
+            for word in synonyms:
+                weights.setdefault(word, weight)
+
+    q = question.lower()
+    sections = []
+    if re.search(r'cash\s+flow|capex|ebitda|d\s*&\s*a|depreciation|amortization|dividend|repurchase|buyback', q):
+        sections.append(r'(?:consolidated\s+)?statements?\s+of\s+cash\s+flows?')
+    if re.search(r'income|earning|profit|ebitda|p\s*&\s*l|restructur|margin|revenue|\bsales\b|\beps\b', q):
+        sections.append(r'(?:consolidated\s+)?(?:statements?\s+of\s+(?:income|operations|earnings)|income\s+statements?)')
+    if re.search(r'balance\s+sheet|asset|liabilit|equity|working\s+capital|current\s+ratio|leverage|liquidity|debt|\bro[ae]\b', q):
+        sections.append(r'(?:consolidated\s+)?balance\s+sheets?')
+    if re.search(r'geograph|countr|region|where|primarily\s+operat|segment', q):
+        sections.append(r'(?:item\s*1[.\s]+business|our\s+(?:divisions|business|operations)|(?:geographic|segment)\s+information)')
+    if re.search(r'legal|litigat|lawsuit|court|battl', q):
+        sections.append(r'(?:item\s*3[.\s]+)?legal\s+proceedings|(?:commitments?\s+and\s+)?contingencies')
+
+    ranked = []
+    for record, doc, text, tokens in pool:
+        counts = Counter(tokens)
+        norm = 1.2 * (0.25 + 0.75 * len(tokens) / average)
+        score = 0.0
+        for term, weight in weights.items():
+            tf = counts[term]
+            if tf:
+                df = min(count, frequency[term])
+                idf = math.log1p((count - df + 0.5) / (df + 0.5))
+                score += weight * idf * tf * 2.2 / (tf + norm)
+
+        section = any(
+            re.search(
+                r'(?m)^\s*(?:' + pattern +
+                r')[. \t]*(?:\(continued\))?[. \t]*$',
+                text.lower(),
+            )
+            for pattern in sections
+        )
+        if section:
+            score += 14.0
+        if matched and doc not in matched:
+            score *= 0.08
+        key = (record.entry.entry_id, record.entry.entry_version_id)
+        if seed_rank and key in seed_rank:
+            score += 0.05 / (1 + seed_rank[key])
+        ranked.append((score, record, doc, text, section))
+
+    ranked.sort(key=lambda row: (-row[0], row[1].entry.entry_id))
+    return ranked
 
 
 async def search_pdf_pages(
     memory, question: str, limit: int = 10,
 ) -> tuple[MemoryCitation, ...]:
-    """Rank live scoped PDF pages and return exact persisted citations."""
-    from collections import Counter
-    import math
-
+    """Search scoped Memory and rerank genuine page citations offline."""
     if not isinstance(question, str) or not question.strip():
-        raise ValueError("question must not be blank")
+        raise ValueError('question must not be blank')
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
-        raise ValueError("limit must be a positive integer")
+        raise ValueError('limit must be a positive integer')
 
-    terms = _pdf_terms(question)
-    query = " ".join(dict.fromkeys(terms)) or question.strip()
+    query = ' '.join(dict.fromkeys(_pdf_terms(question))) or question.strip()
     seed = await memory.search(SearchMemoryRequest(
-        query=query,
-        limit=min(100, max(40, limit * 4)),
-        mode="fts",
+        query=query, limit=max(40, min(100, limit * 4)), mode='fts',
     ))
     seed_rank = {
         (hit.entry_id, hit.entry_version_id): rank
         for rank, hit in enumerate(seed.hits)
     }
-
-    # Read only live entries through the public scoped Memory API.
     snapshot = await memory.list()
-    pages = []
-    seen = set()
+    pages, seen = [], set()
     for record in snapshot.entries:
-        if record.state != "active":
+        if record.state != 'active':
             continue
-        entry = record.entry
-        if len(entry.sources) != 1:
+        refs = record.entry.sources
+        if len(refs) != 1 or refs[0].source_type != 'pdf-page':
             continue
-        source = entry.sources[0]
-        if source.source_type != "pdf-page" or source.source_id in seen:
+        if refs[0].source_id in seen:
             continue
-        seen.add(source.source_id)
-        document_id, _, text = entry.text.partition("\n")
-        tokens = _pdf_terms(text)
-        pages.append((record, document_id, tokens, Counter(tokens)))
-
+        seen.add(refs[0].source_id)
+        doc, _, text = record.entry.text.partition('\n')
+        pages.append((record, doc, text))
     if not pages:
         return ()
 
-    count = len(pages)
-    average = sum(len(tokens) for _, _, tokens, _ in pages) / count or 1
-    frequency = Counter()
-    for _, _, _, counts in pages:
-        frequency.update(counts.keys())
-
-    weights = {term: 1.0 for term in terms}
-    groups = (
-        ("revenue", "sale"),
-        ("profit", "income", "earning"),
-        ("capex", "capital", "expenditure"),
-        ("buyback", "repurchase"),
-        ("dividend", "distribution"),
-        ("depreciation", "amortization"),
-    )
-    for group in groups:
-        if set(group).intersection(weights):
-            for word in group:
-                weights.setdefault(word, 0.22)
-
-    compact_question = re.sub(r"[^a-z0-9]", "", question.lower())
-    document_names = {}
-    for _, doc, _, _ in pages:
-        name = re.split(r"(?:19|20)\d{2}", doc.lower(), maxsplit=1)[0]
-        document_names[doc] = re.sub(r"[^a-z0-9]", "", name)
-    matched_docs = {
-        doc for doc, name in document_names.items()
-        if len(name) >= 2 and name in compact_question
-    }
-    years = set(re.findall(r"\b(?:19|20)\d{2}\b", question))
-    phrase_terms = [term for term in terms if not term.isdigit()]
-    phrases = list(zip(phrase_terms, phrase_terms[1:]))
-
-    ranked = []
-    for record, doc, tokens, counts in pages:
-        norm = 1.2 * (0.25 + 0.75 * len(tokens) / average)
-        score = 0.0
-        covered = 0
-        for term, weight in weights.items():
-            tf = counts[term]
-            if not tf:
-                continue
-            idf = math.log1p(
-                (count - frequency[term] + 0.5) /
-                (frequency[term] + 0.5)
-            )
-            score += weight * idf * tf * 2.2 / (tf + norm)
-            covered += term in terms
-        pairs = set(zip(tokens, tokens[1:]))
-        score += 0.3 * sum(pair in pairs for pair in phrases)
-        score *= 1 + 0.3 * covered / max(1, len(set(terms)))
-        if matched_docs:
-            score *= 2.5 if doc in matched_docs else 0.15
-        if years.intersection(re.findall(r"(?:19|20)\d{2}", doc)):
-            score *= 1.15
-        key = (record.entry.entry_id, record.entry.entry_version_id)
-        if key in seed_rank:
-            score += 0.05 / (1 + seed_rank[key])
-        ranked.append((score, record))
-
-    ranked.sort(key=lambda item: (-item[0], item[1].entry.entry_id))
+    ranked = _pdf_rank_pages(pages, question, seed_rank)
     citations = []
-    for _, record in ranked[:limit]:
+    for _, record, _, _, _ in ranked[:limit]:
         citation = record.citation
         await memory.get(GetMemoryEntryRequest(citation=citation))
         citations.append(citation)
