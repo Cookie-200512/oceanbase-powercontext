@@ -136,8 +136,8 @@ class CSVRowSource(Source):
 
     @model_validator(mode="after")
     def validate_row(self) -> CSVRowSource:
-        if self.name != _SOURCE_NAME:
-            raise CSVRowNameError()
+        if self.name != self.source_id:
+            raise CSVRowIdentityError()
         if self.materialization != SourceMaterialization.CAPTURED:
             raise CSVRowMaterializationError()
         if len(self.columns) != len(self.values):
@@ -151,7 +151,11 @@ class CSVRowSource(Source):
 
 def csv_row_source_id(document_id: str, primary_key_value: str) -> str:
     """Build a stable, length-bounded row ID from identity strings."""
-    if not isinstance(document_id, str) or not document_id.strip():
+    if (
+        not isinstance(document_id, str)
+        or not document_id
+        or document_id != document_id.strip()
+    ):
         raise EmptyDocumentIDError()
     if not isinstance(primary_key_value, str) or not primary_key_value.strip():
         raise EmptyPrimaryKeyValueError()
@@ -234,7 +238,10 @@ def _collect_csv_rows(
 
 def parse_csv_document(value: CSVDocumentInput) -> tuple[CSVRowInput, ...]:
     """Validate the whole document before returning any row input."""
-    if not value.document_id.strip():
+    if (
+        not value.document_id
+        or value.document_id != value.document_id.strip()
+    ):
         raise EmptyDocumentIDError()
     if not value.primary_key or not value.primary_key.strip():
         raise EmptyPrimaryKeyError()
@@ -278,13 +285,14 @@ class _CSVRowSourceDefinition:
     projections = (_CSVRowTextEvidenceProjection(),)
 
     async def resolve(self, value: CSVRowInput, /) -> CSVRowSource:
+        source_id = csv_row_source_id(
+            value.document_id, value.primary_key_value
+        )
         return CSVRowSource(
-            name=self.name,
+            name=source_id,
             definition_version=self.version,
             materialization=SourceMaterialization.CAPTURED,
-            source_id=csv_row_source_id(
-                value.document_id, value.primary_key_value
-            ),
+            source_id=source_id,
             document_id=value.document_id,
             primary_key=value.primary_key,
             primary_key_value=value.primary_key_value,
@@ -292,8 +300,14 @@ class _CSVRowSourceDefinition:
             values=value.values,
         )
 
-    async def read(self, source: CSVRowSource, /) -> dict[str, str]:
-        return dict(zip(source.columns, source.values, strict=True))
+    async def read(self, source: CSVRowSource, /) -> CSVRowInput:
+        return CSVRowInput(
+            document_id=source.document_id,
+            primary_key=source.primary_key,
+            primary_key_value=source.primary_key_value,
+            columns=source.columns,
+            values=source.values,
+        )
 
 
 CSV_ROW_SOURCE_DEFINITION = _CSVRowSourceDefinition()
