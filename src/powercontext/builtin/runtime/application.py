@@ -3293,6 +3293,10 @@ class BuiltinRuntime:
                 return
             if self._scheduler is not None and self._scheduler.running:
                 self._scheduler.pause()
+            for task in tuple(getattr(self, '_count_tasks', {}).values()):
+                task.cancel()
+            getattr(self, '_count_tasks', {}).clear()
+            await asyncio.sleep(0)
             async with self._lifecycle:
                 self._closing = True
                 await self._lifecycle.wait_for(lambda: self._active_operations == 0)
