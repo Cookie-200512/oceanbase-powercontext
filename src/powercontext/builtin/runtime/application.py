@@ -847,6 +847,24 @@ class ScopedContextApplication:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
 
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        *,
+        base_pack: object | None = None,
+    ):
+        """Return a full ContextPack, or a delta against a caller-held base pack."""
+        from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
+
+        prepared = await self.prepare(request)
+        target = ContextPack.from_content(prepared.content or "")
+        if base_pack is None:
+            return target
+        if not isinstance(base_pack, ContextPack):
+            raise InvalidRuntimeRequestError("base-pack")
+        return ContextPackDelta.between(base_pack, target)
+
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)
         if effort is not None and self._runtime._recall_effort_sink is not None:
