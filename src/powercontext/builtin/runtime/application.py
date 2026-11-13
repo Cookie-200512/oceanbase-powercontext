@@ -469,7 +469,9 @@ class ScopedSourceApplication:
         self.scope_id = validate_scope_id(scope_id)
 
     async def capture(self, value: CaptureSource, /) -> SourceReceipt:
-        return await self._capture(value)
+        receipt = await self._capture(value)
+        self._runtime._note_source_sequence(self.scope_id, receipt.sequence)
+        return receipt
 
     async def _capture(self, value: CaptureSource, /, *, handoff_receipt: bool = False) -> SourceReceipt:
         if self._runtime._record_service is not None:
@@ -563,7 +565,9 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        self._runtime._note_source_sequence(self.scope_id, getattr(created, "position", 0))
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -2997,6 +3001,8 @@ class BuiltinRuntime:
         capabilities: RuntimeCapabilities,
         code_service: CodeService | None = None,
         source_window_limit: int = 100,
+        memory_source_count_threshold: int | None = None,
+        topic_memory_source_count_threshold: int | None = None,
         context_assembly_max_entries: int = 8,
         recall_sufficiency_policy: RecallSufficiencyPolicy | None = None,
         scope_cache_size: int = DEFAULT_SCOPE_CACHE_SIZE,
@@ -3097,6 +3103,9 @@ class BuiltinRuntime:
         self.scopes = scope_application
         self._readiness = RuntimeReadinessChecks() if readiness is None else readiness
         self._clock = _utc_now if clock is None else clock
+        self._memory_count_threshold = memory_source_count_threshold
+        self._topic_count_threshold = topic_memory_source_count_threshold
+        self._count_tasks: dict[str, asyncio.Task[None]] = {}
         self._tracing = tracing
         self._scheduled_source_runner = scheduled_source_runner
         self._scheduled_experience_runner = scheduled_experience_runner
@@ -3142,6 +3151,7 @@ class BuiltinRuntime:
         )
 
     async def __aenter__(self) -> BuiltinRuntime:
+        await self._sweep_count_thresholds()
         return self
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
@@ -3328,6 +3338,56 @@ class BuiltinRuntime:
                     self._active_operations -= 1
                     if self._active_operations == 0:
                         self._lifecycle.notify_all()
+
+    def _note_source_sequence(self, scope_id: str, sequence: int, /) -> None:
+        """Schedule one count check after a journal write."""
+        if self._memory_count_threshold is None and self._topic_count_threshold is None:
+            return
+        self._schedule_count_check(scope_id)
+
+    def _schedule_count_check(self, scope_id: str, /) -> None:
+        task = self._count_tasks.get(scope_id)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - callers run inside the loop
+            return
+        self._count_tasks[scope_id] = loop.create_task(self._run_count_flush(scope_id))
+
+    async def _pending_source_count(self, scope_id: str, binding_name: str) -> int:
+        """Pending entries = journal end minus the binding's processed cursor."""
+        async with self._context(scope_id) as context:
+            position = await context.triggers.journal_position()
+            processed = await context.triggers.cursor_for(binding_name)
+        return max(0, position - processed)
+
+    async def _run_count_flush(self, scope_id: str, /) -> None:
+        try:
+            if self._memory_count_threshold is not None:
+                pending = await self._pending_source_count(scope_id, _MEMORY_SOURCE_WINDOW_BINDING)
+                if pending >= self._memory_count_threshold:
+                    await self.memory.for_scope(scope_id).flush()
+            if self._topic_count_threshold is not None:
+                pending = await self._pending_source_count(scope_id, _TOPIC_SOURCE_WINDOW_BINDING)
+                if pending >= self._topic_count_threshold:
+                    await self.topic_memory.for_scope(scope_id).flush()
+        except Exception:  # noqa: BLE001 - a count kick must never break capture
+            logger.exception("Count-driven processing failed", extra={"scope_id": scope_id})
+        finally:
+            self._count_tasks.pop(scope_id, None)
+
+    async def _sweep_count_thresholds(self) -> None:
+        """Resume pending work that already reached the threshold before a restart."""
+        if self._memory_count_threshold is None and self._topic_count_threshold is None:
+            return
+        try:
+            scopes = await self.scopes.list()
+        except Exception:  # noqa: BLE001 - never block startup
+            logger.exception("Count-threshold sweep failed")
+            return
+        for scope in scopes:
+            self._schedule_count_check(scope.scope_id)
 
     @asynccontextmanager
     async def _scope_operation(self, scope_id: str) -> AsyncIterator[ScopeDescriptor]:
@@ -3619,3 +3679,6 @@ async def _last_changed_entry(service: MemoryService, memory: Memory) -> MemoryE
     entry_id = memory.content.changes[-1].entry_id
     entry = next((item for item in await service.entries(memory) if item.entry_id == entry_id), None)
     return None if entry is None else _entry_record(memory, entry)
+
+_MEMORY_SOURCE_WINDOW_BINDING = "memory-source-window"
+_TOPIC_SOURCE_WINDOW_BINDING = "topic-memory-source-window"

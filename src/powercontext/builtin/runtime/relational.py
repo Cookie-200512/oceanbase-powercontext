@@ -1672,6 +1672,21 @@ class _RelationalTriggers:
                 draft=draft,
             )
 
+    async def journal_position(self) -> int:
+        """Current end of this scope's Source journal."""
+        async with self._services.database.transaction() as connection:
+            return await self._services.repositories.sources.journal_position(
+                connection, self._services.scope_id
+            )
+
+    async def cursor_for(self, binding_name: str, /) -> int:
+        """Processed journal position recorded for one processing binding."""
+        async with self._services.database.transaction() as connection:
+            row = await self._services.repositories.cursors.load(
+                connection, self._services.scope_id, binding_name
+            )
+        return 0 if row is None else row.cursor.sequence
+
     async def cursor(self) -> SourceCursor:
         async with self._services.database.transaction() as connection:
             state = await self._services.repositories.cursors.load(
