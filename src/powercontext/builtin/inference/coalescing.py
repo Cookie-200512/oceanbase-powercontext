@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from typing import Any
 
-from powercontext.builtin.inference.models import EmbeddingResult, InferenceUsage
+from powercontext.builtin.inference import EmbeddingResult, InferenceUsage
+
+_DEFAULT_MAX_BATCH_SIZE = 64
+_DEFAULT_COALESCE_MS = 5.0
+_DEFAULT_CACHE_SIZE = 1024
 
 
 class _Batch:
@@ -14,9 +17,9 @@ class _Batch:
 
     __slots__ = ("texts", "usage")
 
-    def __init__(self, texts: tuple[str, ...]) -> None:
-        self.texts = texts
-        self.usage: InferenceUsage | None = None
+    def __init__(self, texts):
+        self.texts = tuple(texts)
+        self.usage = None
 
 
 class CoalescingEmbeddingModel:
@@ -24,37 +27,38 @@ class CoalescingEmbeddingModel:
 
     def __init__(
         self,
-        model: Any,
+        model,
         *,
-        max_batch_size: int = 64,
-        coalesce_ms: float = 5.0,
-        cache_size: int = 1024,
-    ) -> None:
+        max_batch_size=_DEFAULT_MAX_BATCH_SIZE,
+        coalesce_ms=_DEFAULT_COALESCE_MS,
+        cache_size=_DEFAULT_CACHE_SIZE,
+    ):
         if not isinstance(max_batch_size, int) or isinstance(max_batch_size, bool) or max_batch_size < 1:
-            raise ValueError("max_batch_size must be a positive integer")  # noqa: TRY003
+            raise ValueError("max_batch_size must be a positive integer")
         if not isinstance(coalesce_ms, (int, float)) or isinstance(coalesce_ms, bool) or coalesce_ms < 0:
-            raise ValueError("coalesce_ms must be a non-negative number")  # noqa: TRY003
+            raise ValueError("coalesce_ms must be a non-negative number")
         if not isinstance(cache_size, int) or isinstance(cache_size, bool) or cache_size < 0:
-            raise ValueError("cache_size must be a non-negative integer")  # noqa: TRY003
+            raise ValueError("cache_size must be a non-negative integer")
         self._model = model
         self.profile = model.profile
         self._max_batch_size = max_batch_size
         self._coalesce_seconds = coalesce_ms / 1000.0
         self._cache_size = cache_size
-        self._cache: OrderedDict[str, tuple[float, ...]] = OrderedDict()
-        self._futures: dict[str, asyncio.Future[tuple[tuple[float, ...], _Batch]]] = {}
-        self._pending: list[str] = []
-        self._flush_handle: asyncio.TimerHandle | None = None
+        self._cache = OrderedDict()
+        self._futures = {}
+        self._pending = []
+        self._flushing = False
 
-    async def embed(self, texts: tuple[str, ...]) -> EmbeddingResult:
+    async def embed(self, texts):
         """Embed texts in order, sharing duplicate and concurrent work."""
         items = tuple(texts)
         if not items:
             return EmbeddingResult(vectors=(), usage=InferenceUsage(requests=0))
 
         unique = tuple(dict.fromkeys(items))
-        vectors: dict[str, tuple[float, ...]] = {}
-        waiting: list[str] = []
+        vectors = {}
+        waiting = []
+        start_flush = False
 
         for text in unique:
             cached = self._cache.get(text)
@@ -64,18 +68,24 @@ class CoalescingEmbeddingModel:
                 continue
             future = self._futures.get(text)
             if future is None:
-                future = asyncio.get_running_loop().create_future()
+                future = asyncio.get_event_loop().create_future()
                 self._futures[text] = future
                 self._pending.append(text)
-                self._schedule_flush()
+                if not self._flushing:
+                    self._flushing = True
+                    start_flush = True
             waiting.append(text)
 
+        if start_flush:
+            asyncio.ensure_future(self._flush_later())
+
         if waiting:
-            outcomes = await asyncio.gather(
+            gathered = await asyncio.gather(
                 *(asyncio.shield(self._futures[text]) for text in waiting)
             )
-            batches: dict[int, _Batch] = {}
-            for text, (vector, batch) in zip(waiting, outcomes, strict=True):
+            batches = {}
+            for text, outcome in zip(waiting, gathered):
+                vector, batch = outcome
                 vectors[text] = vector
                 batches[id(batch)] = batch
             usage = _sum_usage(tuple(batches.values()))
@@ -87,21 +97,17 @@ class CoalescingEmbeddingModel:
             usage=usage,
         )
 
-    def _schedule_flush(self) -> None:
-        if self._flush_handle is not None:
-            return
-        loop = asyncio.get_running_loop()
-        self._flush_handle = loop.call_later(self._coalesce_seconds, self._flush)
-
-    def _flush(self) -> None:
-        self._flush_handle = None
+    async def _flush_later(self):
+        if self._coalesce_seconds > 0:
+            await asyncio.sleep(self._coalesce_seconds)
         pending = self._pending
         self._pending = []
+        self._flushing = False
         for start in range(0, len(pending), self._max_batch_size):
-            batch = _Batch(tuple(pending[start : start + self._max_batch_size]))
-            asyncio.get_running_loop().create_task(self._execute(batch))
+            batch = _Batch(pending[start : start + self._max_batch_size])
+            asyncio.ensure_future(self._execute(batch))
 
-    async def _execute(self, batch: _Batch) -> None:
+    async def _execute(self, batch):
         try:
             result = await self._model.embed(batch.texts)
         except asyncio.CancelledError:
@@ -110,7 +116,7 @@ class CoalescingEmbeddingModel:
                 if future is not None and not future.done():
                     future.cancel()
             raise
-        except Exception as error:  # noqa: BLE001 - the failure belongs to every waiter
+        except Exception as error:
             for text in batch.texts:
                 future = self._futures.pop(text, None)
                 if future is not None and not future.done():
@@ -128,22 +134,22 @@ class CoalescingEmbeddingModel:
 
         batch.usage = result.usage
         if self._cache_size > 0:
-            for text, vector in zip(batch.texts, vectors, strict=True):
+            for text, vector in zip(batch.texts, vectors):
                 self._cache[text] = vector
                 self._cache.move_to_end(text)
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
 
-        for text, vector in zip(batch.texts, vectors, strict=True):
+        for text, vector in zip(batch.texts, vectors):
             future = self._futures.pop(text, None)
             if future is not None and not future.done():
                 future.set_result((vector, batch))
 
 
-def _sum_usage(batches: tuple[_Batch, ...]) -> InferenceUsage:
+def _sum_usage(batches):
     requests = 0
-    input_tokens: int | None = None
-    output_tokens: int | None = None
+    input_tokens = None
+    output_tokens = None
     for batch in batches:
         usage = batch.usage
         if usage is None:
