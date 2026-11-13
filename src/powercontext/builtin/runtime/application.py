@@ -2591,6 +2591,27 @@ class ScopedMemoryApplication:
                 entry=_entry_record(updated, retired),
             )
 
+    async def restore(self, request: GetMemoryEntryRequest, /) -> MemoryMutationResult:
+        """Reactivate one inactive entry without creating a new body version."""
+        async with self._runtime._context(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+        ) as context:
+            async with self._runtime._locked(self.scope_id):
+                service = context.artifacts.memory
+                current, entry = await _current_citation(
+                    service,
+                    context.artifacts.memory_artifact_id,
+                    request.citation,
+                )
+                updated = await service.reactivate(current, entries=(entry,))
+            restored = next(item for item in await service.entries(updated) if item.entry_id == entry.entry_id)
+            return MemoryMutationResult(
+                previous_revision=current.revision,
+                memory_ref=updated.as_ref(),
+                entry=_entry_record(updated, restored),
+            )
+
     async def changes(self, *, since_revision: int | None = None) -> MemoryChangesPage:
         async with self._runtime._context(self.scope_id) as context:
             service = context.artifacts.memory
@@ -2705,7 +2726,9 @@ class ScopedTopicMemoryApplication:
                         "unit": "topic-memory",
                     },
                 )
-        return result
+        from powercontext.builtin.runtime.source_lifecycle import filter_topic_result
+
+        return filter_topic_result(self.scope_id, result)
 
     async def _search_with_embedding(
         self,
@@ -3103,6 +3126,9 @@ class BuiltinRuntime:
         self.scopes = scope_application
         self._readiness = RuntimeReadinessChecks() if readiness is None else readiness
         self._clock = _utc_now if clock is None else clock
+        from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
+
+        self.lifecycle = SourceLifecycleApplication(self)
         self._memory_count_threshold = memory_source_count_threshold
         self._topic_count_threshold = topic_memory_source_count_threshold
         self._count_tasks: dict[str, asyncio.Task[None]] = {}
@@ -3369,8 +3395,12 @@ class BuiltinRuntime:
     async def _run_count_flush(self, scope_id: str, /) -> None:
         try:
             if self._memory_count_threshold is not None:
-                pending = await self._pending_source_count(scope_id, _MEMORY_SOURCE_WINDOW_BINDING)
-                if pending >= self._memory_count_threshold:
+                # Re-evaluate the remaining count after every successful window:
+                # a single activation must not leave the scope above the threshold.
+                for _ in range(64):
+                    pending = await self._pending_source_count(scope_id, _MEMORY_SOURCE_WINDOW_BINDING)
+                    if pending < self._memory_count_threshold:
+                        break
                     await self.memory.for_scope(scope_id).flush()
             if self._topic_count_threshold is not None:
                 pending = await self._pending_source_count(scope_id, _TOPIC_SOURCE_WINDOW_BINDING)
