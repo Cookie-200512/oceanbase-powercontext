@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +108,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[ContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,16 @@ class MemoryEntryAddress:
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class ContextFragment:
+    """One literal span of a Memory entry selected for the query."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -227,6 +240,12 @@ class PreparedContextBuilder:
                 )
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
+
+        if request.evidence_selection:
+            return self._evidence_result(
+                request=request,
+                memory_candidates=memory_candidates,
+            )
 
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
@@ -660,6 +679,94 @@ class PreparedContextBuilder:
         return _EntryFit(entry=best)
 
 
+    def _evidence_result(
+        self,
+        *,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select literal query-relevant sentences from the Memory candidates."""
+        terms = _query_terms(request.query)
+        sentences: list[tuple[str, MemoryHit, int, int, str, set[str]]] = []
+        for group in memory_candidates:
+            for hit in group.hits:
+                for start, end in _sentence_spans(hit.text):
+                    text = hit.text[start:end]
+                    words = set(_WORD_PATTERN.findall(text.lower()))
+                    sentences.append((group.scope_id, hit, start, end, text, words))
+        if not sentences:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        frequency: dict[str, int] = {}
+        for *_, words in sentences:
+            for word in words & terms:
+                frequency[word] = frequency.get(word, 0) + 1
+        total = len(sentences)
+
+        ranked: list[tuple[float, int, str, MemoryHit, int, int, str]] = []
+        fallback: list[tuple[float, int, str, MemoryHit, int, int, str]] = []
+        seen_hits: set[tuple[str, str]] = set()
+        for order, (scope_id, hit, start, end, text, words) in enumerate(sentences):
+            identity = (hit.entry_id, hit.entry_version_id)
+            if identity not in seen_hits:
+                seen_hits.add(identity)
+                fallback.append((0.0, order, scope_id, hit, start, end, text))
+            matched = words & terms
+            if not matched:
+                continue
+            score = sum(math.log1p(total / frequency[word]) for word in matched)
+            score -= len(text) / 1_000_000
+            ranked.append((score, order, scope_id, hit, start, end, text))
+        ranked.sort(key=lambda row: (-row[0], row[1]))
+        if not ranked:
+            ranked = fallback
+
+        items: list[dict[str, object]] = []
+        fragments: list[ContextFragment] = []
+        origins: list[PreparedContextOrigin] = []
+        for _, _, scope_id, hit, start, end, text in ranked:
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            item = {
+                "citation": {
+                    "scope_id": scope_id,
+                    "memory_ref": hit.memory_ref.model_dump(mode="json"),
+                    "entry_id": hit.entry_id,
+                    "entry_version_id": hit.entry_version_id,
+                },
+                "content": text,
+                "start": start,
+                "end": end,
+            }
+            if len(_render_evidence((*items, item)).encode("utf-8")) > request.max_bytes:
+                continue
+            items.append(item)
+            fragments.append(ContextFragment(address=address, start=start, end=end, text=text))
+            origins.append(
+                MemoryCitation(
+                    memory_ref=hit.memory_ref,
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+            )
+            if len(fragments) >= self.entry_limit:
+                break
+        if not fragments:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = _render_evidence(tuple(items))
+        return PreparedContextBuild(
+            context=PreparedContext(
+                status="ready",
+                content=content,
+                content_bytes=len(content.encode("utf-8")),
+            ),
+            origins=tuple(origins),
+            fragments=tuple(fragments),
+        )
+
 def _interleave(
     memory: Sequence[_PreparedContextEntry],
     topics: Sequence[_PreparedContextEntry],
@@ -728,3 +835,34 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+_SENTENCE_PATTERN = re.compile(r"[^.!?\n]+[.!?]?")
+_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+_QUERY_STOP = frozenset(
+    "the a an of to in on for and or is are was were be been by with that this as at from "
+    "it its we our their they can could does do did has have had not but than then which who "
+    "what when where how why using used use into about over under between during".split()
+)
+
+
+def _query_terms(text: str) -> set[str]:
+    return {
+        word
+        for word in _WORD_PATTERN.findall(text.lower())
+        if len(word) > 1 and word not in _QUERY_STOP
+    }
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    return [
+        (match.start(), match.end())
+        for match in _SENTENCE_PATTERN.finditer(text)
+        if match.group().strip()
+    ]
+
+
+def _render_evidence(items: tuple[dict[str, object], ...]) -> str:
+    envelope = {"trust": "untrusted_history", "items": list(items)}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
