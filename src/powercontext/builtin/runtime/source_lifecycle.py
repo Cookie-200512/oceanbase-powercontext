@@ -157,6 +157,8 @@ class ScopedSourceLifecycleApplication:
         if event.sequence == previous_sequence:
             if node["available"] != event.available:
                 raise SourceLifecycleError("sequence replay conflicts with stored state")  # noqa: TRY003
+            # An interrupted propagation must finish when the same event is retried.
+            await self._sync_memory(nodes)
             return sorted(name for name, item in nodes.items() if item["available"])
         node["sequence"] = event.sequence
         node["available"] = event.available
